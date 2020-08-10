@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
-	"fmt"
 
 	bfx "github.com/bitfinexcom/bitfinex-api-go/v2"
 	bfxWs "github.com/bitfinexcom/bitfinex-api-go/v2/websocket"
@@ -102,6 +102,15 @@ func main() {
 	http.HandleFunc("/ws", wsHandler)
 	go http.ListenAndServe(":5000", nil)
 
+	askRateThresholdBySymbol := map[string]float64{
+		"fUSD": float64(2000) / 100 / 365,
+		"fUST": float64(2000) / 100 / 365,
+	}
+
+	maxBidRateBySymbol := make(map[string]float64)
+	for _, symbol := range symbols {
+		maxBidRateBySymbol[symbol] = float64(0)
+	}
 	for {
 		obj := <-ch
 		switch obj.(type) {
@@ -112,15 +121,50 @@ func main() {
 			bookUpdateSnapshot := obj.(*bfx.BookUpdateSnapshot)
 			for _, snapshot := range bookUpdateSnapshot.Snapshot {
 				amtByRateBySideBySymbol[snapshot.Symbol][snapshot.Side][snapshot.Rate] += snapshot.Amount
+				if snapshot.Rate > maxBidRateBySymbol[snapshot.Symbol] {
+					maxBidRateBySymbol[snapshot.Symbol] = snapshot.Rate
+				}
 			}
 		case *bfx.BookUpdate:
 			bookUpdate := obj.(*bfx.BookUpdate)
 			if bookUpdate.Action == bfx.BookUpdateEntry {
 				amtByRateBySideBySymbol[bookUpdate.Symbol][bookUpdate.Side][bookUpdate.Rate] += bookUpdate.Amount
+				if bookUpdate.Rate > maxBidRateBySymbol[bookUpdate.Symbol] {
+					maxBidRateBySymbol[bookUpdate.Symbol] = bookUpdate.Rate
+				}
 			} else {
 				delete(amtByRateBySideBySymbol[bookUpdate.Symbol][bookUpdate.Side], bookUpdate.Rate)
+				maxBidRateBySymbol[bookUpdate.Symbol] = float64(0)
+				for symbol, amtByRateBySide := range amtByRateBySideBySymbol {
+					if symbol != bookUpdate.Symbol {
+						continue
+					}
+					for side, amtByRate := range amtByRateBySide {
+						if side != bfx.Bid {
+							continue
+						}
+						for rate := range amtByRate {
+							if rate > maxBidRateBySymbol[bookUpdate.Symbol] {
+								maxBidRateBySymbol[bookUpdate.Symbol] = rate
+							}
+						}
+					}
+				}
 			}
-			log.Println(amtByRateBySideBySymbol)
+			for symbol, askRateThreshold := range askRateThresholdBySymbol {
+				if maxBidRateBySymbol[symbol] >= askRateThreshold {
+					ctx, cancelCtx := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancelCtx()
+					client.SubmitFundingOffer(ctx, &bfx.FundingOfferRequest{
+						Type:   "LIMIT",
+						Symbol: symbol,
+						Amount: float64(50),
+						Rate:   maxBidRateBySymbol[symbol],
+						Period: int64(30),
+						Hidden: false,
+					})
+				}
+			}
 		default:
 			log.Printf("MSG RECV: %#v", obj)
 		}
